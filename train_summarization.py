@@ -6,22 +6,30 @@ import evaluate
 import numpy as np
 from ast_simplifier import JavaCodeSimplifier
 import math
+
+print(f"Is CUDA available: {torch.cuda.is_available()}")
+print(f"Device count: {torch.cuda.device_count()}")
+print(f"Current device: {torch.cuda.current_device()}")
+print(f"Device name: {torch.cuda.get_device_name(0)}")
+
+
 # ================= 配置 =================
-MODEL_CHECKPOINT = "Salesforce/codet5-base"
+MODEL_CHECKPOINT = "./codet5-base-local"
 MAX_INPUT_LENGTH = 512  # CodeT5 输入限制
-MAX_TARGET_LENGTH = 128 # 摘要输出限制
-BATCH_SIZE = 8
+MAX_TARGET_LENGTH = 128  # 摘要输出限制
+BATCH_SIZE = 16
 EPOCHS = 3
 LEARNING_RATE = 2e-5
-SIMPLIFY_RATIO = 0.3 # 30% 简化率
+SIMPLIFY_RATIO = 0.3  # 30% 简化率
 
 # ================= 数据准备 =================
-# 加载你的数据集 (假设你有 train.jsonl 和 test.jsonl)
+# 加载你的数据集
 data_files = {"train": "java/train.jsonl", "test": "java/test.jsonl"}
 dataset = load_dataset("json", data_files=data_files)
 
-# 初始化组件
-tokenizer = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT)
+# 修复点 1: 强制使用 use_fast=False，避免 Rust Tokenizer 的类型报错
+# CodeT5 基于 Roberta，Python 版 tokenizer 更加稳定
+tokenizer = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT, use_fast=False)
 simplifier = JavaCodeSimplifier()
 bleu = evaluate.load("sacrebleu")
 
@@ -31,62 +39,70 @@ def preprocess_data(examples):
     codes = examples['code']
     docstrings = examples['docstring']
 
+    # 2. 加强版的安全字符串转换函数
+    def safe_str(x):
+        if x is None:
+            return ""
+        if isinstance(x, (float, int)) and math.isnan(float(x)):
+            return ""
+
+        s = str(x)
+
+        # 核心修复: 尝试编码为 utf-8 (忽略错误) 再解码，彻底去除非法代理字符
+        try:
+            # 'surrogatepass' 允许代理字符存在，但我们这里想去掉它们，或者转成 replacement char
+            # 方法 A: 忽略错误 (直接丢弃非法字符)
+            s = s.encode('utf-8', 'ignore').decode('utf-8')
+
+            # 或者 方法 B: 替换错误 (变成 ) - 推荐忽略，以免影响代码语法
+            # s = s.encode('utf-8', 'replace').decode('utf-8')
+        except Exception:
+            # 兜底: 如果连 encode 都报错，就强制过滤
+            return ""
+
+        return s.strip()
+
+    # 3. 预处理列表
     if not isinstance(codes, list):
         codes = [codes]
     if not isinstance(docstrings, list):
         docstrings = [docstrings]
 
-    # 2. 统一转成字符串,处理 None/NaN
-    def safe_str(x):
-        if x is None:
-            return ""
-        if isinstance(x, float) and math.isnan(x):
-            return ""
-        return str(x)
+    clean_codes = [safe_str(c) for c in codes]
+    clean_docs = [safe_str(d) for d in docstrings]
 
-    codes = [safe_str(c) for c in codes]
-    docstrings = [safe_str(d) for d in docstrings]
-
-    # 3. 简化代码
-    simplified_codes = []
-    for c in codes:
+    # 4. 简化代码
+    final_codes = []
+    for c in clean_codes:
+        if not c:
+            final_codes.append("empty code")
+            continue
         try:
             result = simplifier.simplify(c, SIMPLIFY_RATIO)
-            # 强制转成字符串
-            simplified_codes.append(str(result) if result is not None else "")
-        except:
-            simplified_codes.append("")
+            # 对简化后的结果再次清洗，以防万一
+            safe_result = safe_str(result)
+            final_codes.append(safe_result if safe_result else "empty code")
+        except Exception as e:
+            # 打印出错的代码片段以便调试 (可选)
+            # print(f"Simplification error on: {c[:20]}... : {e}")
+            final_codes.append("empty code")
 
-    # 4. 用占位符替换无效样本,并最终强制类型检查
-    final_codes = []
-    final_docs = []
-    for c, d in zip(simplified_codes, docstrings):
-        # 强制转成字符串并去空格
-        code_str = str(c).strip() if c else ""
-        doc_str = str(d).strip() if d else ""
+    # 5. 处理摘要
+    final_docs = [d if d else "No documentation" for d in clean_docs]
 
-        # 用占位符替换空字符串
-        final_codes.append(code_str if code_str else "empty code")
-        final_docs.append(doc_str if doc_str else "No documentation")
+    # 6. Tokenize
+    if len(final_codes) == 0:
+        return {"input_ids": [], "attention_mask": [], "labels": []}
 
-    # 5. 最终类型检查:确保每个元素都是字符串
-    final_codes = [str(x) for x in final_codes]
-    final_docs = [str(x) for x in final_docs]
-
-    # 6. 确保长度一致
-    assert len(final_codes) == len(codes)
-    assert len(final_docs) == len(docstrings)
-
-    # 7. Tokenize
     model_inputs = tokenizer(
-        final_codes,
+        text=final_codes,
         max_length=MAX_INPUT_LENGTH,
         truncation=True,
         padding="max_length",
     )
 
     labels = tokenizer(
-        final_docs,
+        text=final_docs,
         max_length=MAX_TARGET_LENGTH,
         truncation=True,
         padding="max_length",
@@ -95,49 +111,57 @@ def preprocess_data(examples):
     model_inputs["labels"] = labels["input_ids"]
     return model_inputs
 
+
 # 处理数据集
+# 修复点 3: 减少 batch_size 或设为 None (一次处理一个) 来调试，或者保持 batched=Tr=
+# 如果依然报错，可以将 num_proc=1 强制单进程运行
 tokenized_datasets = dataset.map(
     preprocess_data,
     batched=True,
+    batch_size=100,  # 适当减小 batch size
     remove_columns=dataset['train'].column_names,
+    desc="Processing dataset",
+    # num_proc=1 # 如果在 Windows 上依然有问题，取消注释这一行
 )
 
 # ================= 模型设置 =================
 model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_CHECKPOINT)
+
 
 # 定义评估指标计算函数
 def compute_metrics(eval_pred):
     preds, labels = eval_pred
     if isinstance(preds, tuple):
         preds = preds[0]
-        
-    # 解码生成的 ID 为文本
+
     decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
-    
-    # 替换掉 labels 里的 -100 (PyTorch 忽略的索引)
+
     labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
     decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-    # 后处理：去掉多余空格
     decoded_preds = [pred.strip() for pred in decoded_preds]
-    decoded_labels = [[label.strip()] for label in decoded_labels] # BLEU 需要 list of list
+    decoded_labels = [[label.strip()] for label in decoded_labels]
 
     result = bleu.compute(predictions=decoded_preds, references=decoded_labels)
     return {"bleu": result["score"]}
 
+
 # ================= 训练参数 =================
 args = Seq2SeqTrainingArguments(
     output_dir=f"./codet5-simplified-{SIMPLIFY_RATIO}",
-    evaluation_strategy="epoch",
+    eval_strategy="epoch",
     learning_rate=LEARNING_RATE,
     per_device_train_batch_size=BATCH_SIZE,
     per_device_eval_batch_size=BATCH_SIZE,
     weight_decay=0.01,
     save_total_limit=2,
     num_train_epochs=EPOCHS,
-    predict_with_generate=True, # 评估时生成文本
-    fp16=torch.cuda.is_available(), # 如果有 GPU 开启混合精度
+    predict_with_generate=True,
+    fp16=True,
     push_to_hub=False,
+    logging_steps=50,
+    gradient_accumulation_steps=4
+
 )
 
 # 数据整理器
