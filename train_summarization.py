@@ -139,9 +139,6 @@ tokenized_datasets = dataset.map(
 # ================= 模型设置 =================
 model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_CHECKPOINT)
 
-# 启用梯度检查点以减少显存使用，允许更大的 batch size
-model.gradient_checkpointing_enable()
-
 # 使用 torch.compile 加速模型 (PyTorch 2.0+)
 if hasattr(torch, 'compile'):
     print("Enabling torch.compile for faster training...")
