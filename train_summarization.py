@@ -1,16 +1,29 @@
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, DataCollatorForSeq2Seq
-from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
+from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer, EarlyStoppingCallback
 from datasets import load_dataset
 import evaluate
 import numpy as np
 from ast_simplifier import JavaCodeSimplifier
 import math
+import os
+
+# ================= 性能优化配置 =================
+# 设置多进程数据加载的工作进程数
+NUM_WORKERS = min(4, os.cpu_count() or 1)
 
 print(f"Is CUDA available: {torch.cuda.is_available()}")
-print(f"Device count: {torch.cuda.device_count()}")
-print(f"Current device: {torch.cuda.current_device()}")
-print(f"Device name: {torch.cuda.get_device_name(0)}")
+if torch.cuda.is_available():
+    print(f"Device count: {torch.cuda.device_count()}")
+    print(f"Current device: {torch.cuda.current_device()}")
+    print(f"Device name: {torch.cuda.get_device_name(0)}")
+    
+    # 检测是否支持 bf16 (Ampere 架构及以上)
+    BF16_SUPPORTED = torch.cuda.get_device_capability()[0] >= 8
+    print(f"BF16 supported: {BF16_SUPPORTED}")
+else:
+    BF16_SUPPORTED = False
+    print("CUDA not available, running on CPU")
 
 
 # ================= 配置 =================
@@ -113,19 +126,23 @@ def preprocess_data(examples):
 
 
 # 处理数据集
-# 修复点 3: 减少 batch_size 或设为 None (一次处理一个) 来调试，或者保持 batched=Tr=
-# 如果依然报错，可以将 num_proc=1 强制单进程运行
+# 使用多进程加速数据预处理
 tokenized_datasets = dataset.map(
     preprocess_data,
     batched=True,
-    batch_size=100,  # 适当减小 batch size
+    batch_size=100,
     remove_columns=dataset['train'].column_names,
     desc="Processing dataset",
-    # num_proc=1 # 如果在 Windows 上依然有问题，取消注释这一行
+    num_proc=NUM_WORKERS,  # 多进程加速数据预处理
 )
 
 # ================= 模型设置 =================
 model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_CHECKPOINT)
+
+# 使用 torch.compile 加速模型 (PyTorch 2.0+)
+if hasattr(torch, 'compile'):
+    print("Enabling torch.compile for faster training...")
+    model = torch.compile(model)
 
 
 # 定义评估指标计算函数
@@ -157,15 +174,30 @@ args = Seq2SeqTrainingArguments(
     save_total_limit=2,
     num_train_epochs=EPOCHS,
     predict_with_generate=True,
-    fp16=True,
+    # 混合精度训练: 优先使用 bf16 (更稳定), 否则使用 fp16
+    fp16=not BF16_SUPPORTED,
+    bf16=BF16_SUPPORTED,
     push_to_hub=False,
     logging_steps=50,
-    gradient_accumulation_steps=4
-
+    gradient_accumulation_steps=4,
+    # 数据加载优化
+    dataloader_num_workers=NUM_WORKERS,
+    dataloader_pin_memory=True,
+    # 早停和最佳模型保存
+    load_best_model_at_end=True,
+    metric_for_best_model="bleu",
+    greater_is_better=True,
+    # 梯度检查点已在模型上启用
+    gradient_checkpointing=True,
+    # 禁用完整的 eval 预测以加速
+    include_inputs_for_metrics=False,
 )
 
 # 数据整理器
 data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+
+# 早停回调: 如果验证集指标连续 2 个 epoch 没有改善，则提前停止训练
+early_stopping_callback = EarlyStoppingCallback(early_stopping_patience=2)
 
 # ================= 开始训练 =================
 trainer = Seq2SeqTrainer(
@@ -175,7 +207,8 @@ trainer = Seq2SeqTrainer(
     eval_dataset=tokenized_datasets["test"],
     data_collator=data_collator,
     tokenizer=tokenizer,
-    compute_metrics=compute_metrics
+    compute_metrics=compute_metrics,
+    callbacks=[early_stopping_callback],  # 添加早停回调
 )
 
 print("Starting training...")

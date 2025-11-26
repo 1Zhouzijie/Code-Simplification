@@ -1,0 +1,31 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Training outputs
+codet5-simplified-*/
+final_model_*/
+
+# Model files
+*.bin
+*.pt
+*.pth
+*.safetensors
+
+# Logs
+*.log
+logs/
+
+# Checkpoints
+checkpoint-*/
+
+# HuggingFace cache
+.cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
