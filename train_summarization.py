@@ -9,70 +9,57 @@ import math
 import os
 
 # ================= 性能优化配置 =================
-# 设置多进程数据加载的工作进程数
-NUM_WORKERS = min(4, os.cpu_count() or 1)
+# Windows 上最稳妥的方式是设为 0
+NUM_WORKERS = 0
 
-print(f"Is CUDA available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"Device count: {torch.cuda.device_count()}")
-    print(f"Current device: {torch.cuda.current_device()}")
-    print(f"Device name: {torch.cuda.get_device_name(0)}")
-    
-    # 检测是否支持 bf16 (Ampere 架构及以上)
-    BF16_SUPPORTED = torch.cuda.get_device_capability()[0] >= 8
-    print(f"BF16 supported: {BF16_SUPPORTED}")
-else:
-    BF16_SUPPORTED = False
-    print("CUDA not available, running on CPU")
-
-
-# ================= 配置 =================
+# ================= 全局配置 =================
 MODEL_CHECKPOINT = "./codet5-base-local"
-MAX_INPUT_LENGTH = 512  # CodeT5 输入限制
-MAX_TARGET_LENGTH = 128  # 摘要输出限制
+MAX_INPUT_LENGTH = 512
+MAX_TARGET_LENGTH = 128
 BATCH_SIZE = 16
 EPOCHS = 3
 LEARNING_RATE = 2e-5
-SIMPLIFY_RATIO = 0.3  # 30% 简化率
+SIMPLIFY_RATIO = 0.3
 
-# ================= 数据准备 =================
-# 加载你的数据集
-data_files = {"train": "java/train.jsonl", "test": "java/test.jsonl"}
-dataset = load_dataset("json", data_files=data_files)
 
-# 修复点 1: 强制使用 use_fast=False，避免 Rust Tokenizer 的类型报错
-# CodeT5 基于 Roberta，Python 版 tokenizer 更加稳定
-tokenizer = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT, use_fast=False)
+TRAIN_FRACTION = 1/3
+
+# ================= 全局对象初始化 =================
+# 注意：在 Windows 多进程中，这些全局对象可能会被重复初始化，
+# 但由于 NUM_WORKERS=0，这里是安全的。
 simplifier = JavaCodeSimplifier()
-bleu = evaluate.load("sacrebleu")
+# 预先加载 tokenizer 以供全局函数使用
+try:
+    tokenizer_global = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT, use_fast=False)
+except:
+    tokenizer_global = None  # 还没下载好时可能报错，先忽略
 
 
+# ================= 数据预处理函数 (全局) =================
 def preprocess_data(examples):
+    # 如果 tokenizer 还没加载（比如第一次运行），尝试加载
+    global tokenizer_global
+    if tokenizer_global is None:
+        tokenizer_global = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT, use_fast=False)
+
+    tokenizer = tokenizer_global
+
     # 1. 统一转成列表
     codes = examples['code']
     docstrings = examples['docstring']
 
-    # 2. 加强版的安全字符串转换函数
+    # 2. 安全字符串转换函数
     def safe_str(x):
         if x is None:
             return ""
         if isinstance(x, (float, int)) and math.isnan(float(x)):
             return ""
-
         s = str(x)
-
-        # 核心修复: 尝试编码为 utf-8 (忽略错误) 再解码，彻底去除非法代理字符
         try:
-            # 'surrogatepass' 允许代理字符存在，但我们这里想去掉它们，或者转成 replacement char
-            # 方法 A: 忽略错误 (直接丢弃非法字符)
+            # 忽略非法字符
             s = s.encode('utf-8', 'ignore').decode('utf-8')
-
-            # 或者 方法 B: 替换错误 (变成 ) - 推荐忽略，以免影响代码语法
-            # s = s.encode('utf-8', 'replace').decode('utf-8')
         except Exception:
-            # 兜底: 如果连 encode 都报错，就强制过滤
             return ""
-
         return s.strip()
 
     # 3. 预处理列表
@@ -91,19 +78,18 @@ def preprocess_data(examples):
             final_codes.append("empty code")
             continue
         try:
+            # 调用简化器
             result = simplifier.simplify(c, SIMPLIFY_RATIO)
-            # 对简化后的结果再次清洗，以防万一
             safe_result = safe_str(result)
             final_codes.append(safe_result if safe_result else "empty code")
-        except Exception as e:
-            # 打印出错的代码片段以便调试 (可选)
-            # print(f"Simplification error on: {c[:20]}... : {e}")
+        except Exception:
             final_codes.append("empty code")
 
     # 5. 处理摘要
     final_docs = [d if d else "No documentation" for d in clean_docs]
 
     # 6. Tokenize
+    # 处理空数据情况
     if len(final_codes) == 0:
         return {"input_ids": [], "attention_mask": [], "labels": []}
 
@@ -125,94 +111,125 @@ def preprocess_data(examples):
     return model_inputs
 
 
-# 处理数据集
-# 使用多进程加速数据预处理
-tokenized_datasets = dataset.map(
-    preprocess_data,
-    batched=True,
-    batch_size=100,
-    remove_columns=dataset['train'].column_names,
-    desc="Processing dataset",
-    num_proc=NUM_WORKERS,  # 多进程加速数据预处理
-)
+# ================= 主执行块 =================
+if __name__ == "__main__":
+    # 设置 Hugging Face 镜像
+    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
-# ================= 模型设置 =================
-model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_CHECKPOINT)
+    print(f"Is CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"Device: {torch.cuda.get_device_name(0)}")
+        BF16_SUPPORTED = torch.cuda.get_device_capability()[0] >= 8
+    else:
+        BF16_SUPPORTED = False
 
-# 使用 torch.compile 加速模型 (PyTorch 2.0+)
-if hasattr(torch, 'compile'):
-    print("Enabling torch.compile for faster training...")
-    model = torch.compile(model)
+    # 1. 重新确保 tokenizer 可用
+    if tokenizer_global is None:
+        tokenizer_global = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT, use_fast=False)
+    tokenizer = tokenizer_global
 
-
-# 定义评估指标计算函数
-def compute_metrics(eval_pred):
-    preds, labels = eval_pred
-    if isinstance(preds, tuple):
-        preds = preds[0]
-
-    decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
-
-    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
-    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-    decoded_preds = [pred.strip() for pred in decoded_preds]
-    decoded_labels = [[label.strip()] for label in decoded_labels]
-
-    result = bleu.compute(predictions=decoded_preds, references=decoded_labels)
-    return {"bleu": result["score"]}
+    # 定义 compute_metrics (闭包引用 tokenizer)
+    bleu = evaluate.load("sacrebleu")
 
 
-# ================= 训练参数 =================
-args = Seq2SeqTrainingArguments(
-    output_dir=f"./codet5-simplified-{SIMPLIFY_RATIO}",
-    eval_strategy="epoch",
-    learning_rate=LEARNING_RATE,
-    per_device_train_batch_size=BATCH_SIZE,
-    per_device_eval_batch_size=BATCH_SIZE,
-    weight_decay=0.01,
-    save_total_limit=2,
-    num_train_epochs=EPOCHS,
-    predict_with_generate=True,
-    # 混合精度训练: 优先使用 bf16 (更稳定), 否则使用 fp16
-    fp16=not BF16_SUPPORTED,
-    bf16=BF16_SUPPORTED,
-    push_to_hub=False,
-    logging_steps=50,
-    gradient_accumulation_steps=4,
-    # 数据加载优化
-    dataloader_num_workers=NUM_WORKERS,
-    dataloader_pin_memory=True,
-    # 早停和最佳模型保存
-    load_best_model_at_end=True,
-    metric_for_best_model="bleu",
-    greater_is_better=True,
-    # 梯度检查点已在模型上启用
-    gradient_checkpointing=True,
-    # 禁用完整的 eval 预测以加速
-    include_inputs_for_metrics=False,
-)
+    def compute_metrics(eval_pred):
+        preds, labels = eval_pred
+        if isinstance(preds, tuple):
+            preds = preds[0]
 
-# 数据整理器
-data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
 
-# 早停回调: 如果验证集指标连续 2 个 epoch 没有改善，则提前停止训练
-early_stopping_callback = EarlyStoppingCallback(early_stopping_patience=2)
+        # 处理 -100
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-# ================= 开始训练 =================
-trainer = Seq2SeqTrainer(
-    model,
-    args,
-    train_dataset=tokenized_datasets["train"],
-    eval_dataset=tokenized_datasets["test"],
-    data_collator=data_collator,
-    tokenizer=tokenizer,
-    compute_metrics=compute_metrics,
-    callbacks=[early_stopping_callback],  # 添加早停回调
-)
+        decoded_preds = [pred.strip() for pred in decoded_preds]
+        decoded_labels = [[label.strip()] for label in decoded_labels]
 
-print("Starting training...")
-trainer.train()
+        result = bleu.compute(predictions=decoded_preds, references=decoded_labels)
+        return {"bleu": result["score"]}
 
-# 保存最终模型
-trainer.save_model(f"./final_model_{SIMPLIFY_RATIO}")
+
+    # 2. 加载数据
+    data_files = {"train": "java/train.jsonl", "test": "java/test.jsonl"}
+    dataset = load_dataset("json", data_files=data_files)
+
+    dataset['train'] = dataset['train'].train_test_split(train_size=TRAIN_FRACTION, shuffle=True, seed=42)['train']
+    print(f"Train size after sampling: {len(dataset['train'])}, Test size: {len(dataset['test'])}")
+    # 调试：只取少量数据测试流程！(跑通后再注释掉)
+    # print("Debug: Taking subset of data...")
+    # dataset['train'] = dataset['train'].select(range(50))
+    # dataset['test'] = dataset['test'].select(range(10))
+
+    # 3. 处理数据
+    print("Processing dataset...")
+    column_names = dataset['train'].column_names
+
+    tokenized_datasets = dataset.map(
+        preprocess_data,
+        batched=True,
+        batch_size=100,
+        remove_columns=column_names,  # 强制移除旧列
+        desc="Processing dataset",
+        num_proc=NUM_WORKERS if NUM_WORKERS > 0 else None,
+        load_from_cache_file=False  # 禁用缓存，防止读取到以前错误的空结果
+    )
+
+    print(f"Processed columns: {tokenized_datasets['train'].column_names}")
+
+    # 强制格式检查
+    model_columns = ["input_ids", "attention_mask", "labels"]
+    tokenized_datasets.set_format(
+        type="torch",
+        columns=model_columns,
+        output_all_columns=False
+    )
+
+    # 4. 模型初始化
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_CHECKPOINT)
+
+    # 5. 参数设置
+    args = Seq2SeqTrainingArguments(
+        output_dir=f"./codet5-simplified-{SIMPLIFY_RATIO}",
+        eval_strategy="epoch",
+        save_strategy="epoch",  # 必须匹配
+        learning_rate=LEARNING_RATE,
+        per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=BATCH_SIZE,
+        weight_decay=0.01,
+        save_total_limit=2,
+        num_train_epochs=EPOCHS,
+        predict_with_generate=True,
+        fp16=not BF16_SUPPORTED,
+        bf16=BF16_SUPPORTED,
+        push_to_hub=False,
+        logging_steps=50,
+        gradient_accumulation_steps=4,
+        dataloader_num_workers=NUM_WORKERS,
+        dataloader_pin_memory=True,
+        load_best_model_at_end=True,
+        metric_for_best_model="bleu",
+        greater_is_better=True,
+        gradient_checkpointing=True,
+        include_inputs_for_metrics=False,
+        remove_unused_columns=False,  # 防止误删列
+    )
+
+    # 6. 开始训练
+    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+    early_stopping_callback = EarlyStoppingCallback(early_stopping_patience=2)
+
+    trainer = Seq2SeqTrainer(
+        model,
+        args,
+        train_dataset=tokenized_datasets["train"],
+        eval_dataset=tokenized_datasets["test"],
+        data_collator=data_collator,
+        tokenizer=tokenizer,
+        compute_metrics=compute_metrics,
+        callbacks=[early_stopping_callback],
+    )
+
+    print("Starting training...")
+    trainer.train()
+    trainer.save_model(f"./final_model_{SIMPLIFY_RATIO}")
