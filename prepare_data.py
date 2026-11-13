@@ -1,37 +1,38 @@
+import argparse
+
 from datasets import load_dataset
+
 from ast_simplifier import JavaCodeSimplifier
 
-# 初始化简化器
+
 simplifier = JavaCodeSimplifier()
-REMOVE_RATIO = 0.3  # 设定简化比例
+REMOVE_RATIO = 0.3
 
-def preprocess_function(examples):
-    """
-    这个函数会被 map 应用到整个数据集
-    """
-    inputs = []
-    targets = []
-    
-    for code, doc in zip(examples['code'], examples['docstring']):
-        # 1. 应用简化算法
-        simplified_code = simplifier.simplify(code, remove_ratio=REMOVE_RATIO)
-        inputs.append(simplified_code)
-        targets.append(doc)
-    
-    return {"simplified_code": inputs, "summary": targets}
 
-def load_and_process_data(file_path):
-    # 加载本地 JSONL 数据
-    dataset = load_dataset('json', data_files=file_path, split='train')
-    
-    # 为了演示，只取前 1000 条，实际跑的时候去掉这一行
-    dataset = dataset.select(range(1000))
-    
-    # 应用处理
-    processed_dataset = dataset.map(preprocess_function, batched=True)
-    return processed_dataset
+def preprocess_function(examples, remove_ratio=REMOVE_RATIO):
+    return {
+        "simplified_code": [simplifier.simplify(code, remove_ratio) for code in examples["code"]],
+        "summary": examples["docstring"],
+    }
+
+
+def load_and_process_data(file_path, limit=1000, remove_ratio=REMOVE_RATIO):
+    """Preview up to limit JSONL records with code and docstring fields."""
+    if limit < 1 or not 0 <= remove_ratio <= 1:
+        raise ValueError("limit must be positive and remove_ratio must be between 0 and 1")
+    dataset = load_dataset("json", data_files=str(file_path), split="train")
+    dataset = dataset.select(range(min(limit, len(dataset))))
+    return dataset.map(preprocess_function, batched=True, fn_kwargs={"remove_ratio": remove_ratio})
+
 
 if __name__ == "__main__":
-    # 测试一下
-    ds = load_and_process_data("java/train.jsonl")
-    print(ds[0])
+    parser = argparse.ArgumentParser(description="Preview Java summary dataset preprocessing.")
+    parser.add_argument("file", nargs="?", default="java/train.jsonl")
+    parser.add_argument("--limit", type=int, default=1000)
+    parser.add_argument("--ratio", type=float, default=REMOVE_RATIO)
+    args = parser.parse_args()
+    if args.limit < 1 or not 0 <= args.ratio <= 1:
+        parser.error("--limit must be positive and --ratio must be between 0 and 1")
+    processed = load_and_process_data(args.file, args.limit, args.ratio)
+    if len(processed):
+        print(processed[0])

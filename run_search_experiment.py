@@ -1,257 +1,185 @@
-import torch
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
-from datasets import Dataset
-import os
-from tqdm import tqdm
-import numpy as np
-import matplotlib.pyplot as plt
-import gc
+"""Evaluate Java token removal on paired docstring-to-code retrieval."""
+
+import argparse
+import csv
 import json
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from datasets import Dataset
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import AutoTokenizer, set_seed
+
 from ast_simplifier import JavaCodeSimplifier
 from model_search import CodeSearchModel
 
-# ================= 1. 全局配置 (在此修改) =================
-# 本地模型路径 (请修改为您实际的本地路径)
-LOCAL_MODEL_PATHS = {
-    "codebert": "./codebert-base-local",  # 请确保已下载并解压到此文件夹
-    "codet5": "./codet5-base-local"       # 您已有的 CodeT5 路径
-}
 
-# 数据文件路径
-TRAIN_FILE = "java_research/train.txt"   # 您的 txt 训练文件
-TEST_FILE = "java_research/java_test_0.jsonl"   # 您的 jsonl 测试文件
+MODELS = {"codebert": "microsoft/codebert-base", "codet5": "Salesforce/codet5-base"}
 
-RATIOS_TO_TEST = [0,0.1,0.3,0.5]
-MODELS_TO_TEST = [ "codet5"]
 
-BATCH_SIZE = 16
-EPOCHS = 3
-LR = 2e-5
-MAX_LENGTH = 256
-NUM_WORKERS = 0 
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", choices=MODELS, default="codet5")
+    parser.add_argument("--model-path", help="Local checkpoint directory or Hugging Face model ID")
+    parser.add_argument("--train-file", type=Path, default=Path("java_research/train.txt"))
+    parser.add_argument("--test-file", type=Path, default=Path("java_research/java_test_0.jsonl"))
+    parser.add_argument("--ratios", type=float, nargs="+", default=[0, 0.1, 0.2, 0.3, 0.4, 0.5])
+    parser.add_argument("--sample-fraction", type=float, default=0.1,
+                        help="Fraction of usable pairs sampled independently from each split")
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs/search"))
+    args = parser.parse_args()
+    if any(not 0 <= r <= 1 for r in args.ratios) or not 0 < args.sample_fraction <= 1:
+        parser.error("ratios must be in [0, 1] and sample-fraction in (0, 1]")
+    if len(set(args.ratios)) != len(args.ratios):
+        parser.error("each ratio must be unique")
+    if args.epochs < 1 or args.batch_size < 2 or args.seed < 0:
+        parser.error("epochs must be positive, batch-size at least 2, and seed nonnegative")
+    return args
 
-# 显卡加速配置
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 
-# ================= 2. 数据读取函数 (核心修改) =================
-def load_custom_dataset():
-    """
-    自定义加载逻辑：
-    - Train: 读取 .txt 文件
-    - Test: 读取 .jsonl 文件
-    """
-    print(f"Loading datasets...")
-    
-    # --- 1. 加载训练集 (TXT) ---
-    train_codes = []
-    train_docs = []
-    
-    # 假设 txt 文件每一行是用 TAB 分隔的: "code \t docstring"
-    # 如果您的格式不同 (比如两行一条)，请告诉我，我再改
-    with open(TRAIN_FILE, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line: continue
-            
-            # 尝试按 TAB 分割
-            parts = line.split('\t')
-            if len(parts) >= 2:
-                # 假设第一列是 code，第二列是 doc (根据实际情况调整)
-                train_codes.append(parts[0]) 
-                train_docs.append(parts[1])
-            else:
-                # 如果没有 TAB，可能这行全是代码，或者格式不对，暂且跳过或作为单列处理
-                pass 
-    
-    print(f"  Loaded {len(train_codes)} training samples from txt.")
-    train_dataset = Dataset.from_dict({"code": train_codes, "docstring": train_docs})
+def training_pairs(path):
+    with path.open(encoding="utf-8") as source:
+        for line_number, line in enumerate(source, 1):
+            if not line.strip():
+                continue
+            fields = line.rstrip("\r\n").split("<CODESPLIT>", 4)
+            if len(fields) != 5 or fields[0].strip() not in {"0", "1"}:
+                raise ValueError(f"{path}:{line_number}: expected five <CODESPLIT> fields")
+            label, _, _, docstring, code = fields
+            if label.strip() == "1" and code.strip() and docstring.strip():
+                yield {"code": code, "docstring": docstring.strip()}
 
-    # --- 2. 加载测试集 (JSONL) ---
-    test_codes = []
-    test_docs = []
-    
-    with open(TEST_FILE, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line: continue
+
+def test_pairs(path):
+    with path.open(encoding="utf-8") as source:
+        for line_number, line in enumerate(source, 1):
+            if not line.strip():
+                continue
             try:
                 item = json.loads(line)
-                # 兼容不同的 key 名，比如有的数据集叫 'code_tokens' 有的叫 'code'
-                c = item.get('code') or item.get('function_tokens') or ""
-                d = item.get('docstring') or item.get('docstring_tokens') or ""
-                
-                # 如果是 list (tokenized)，转回 string
-                if isinstance(c, list): c = " ".join(c)
-                if isinstance(d, list): d = " ".join(d)
-                
-                test_codes.append(c)
-                test_docs.append(d)
-            except:
-                continue
-                
-    print(f"  Loaded {len(test_codes)} test samples from jsonl.")
-    test_dataset = Dataset.from_dict({"code": test_codes, "docstring": test_docs})
-    
-    return train_dataset, test_dataset
+                code = item.get("code") or item.get("code_tokens") or item.get("function_tokens")
+                doc = item.get("docstring") or item.get("docstring_tokens")
+                if isinstance(code, list):
+                    code = " ".join(code)
+                if isinstance(doc, list):
+                    doc = " ".join(doc)
+                if not isinstance(code, str) or not isinstance(doc, str):
+                    raise ValueError("missing code or docstring")
+            except (ValueError, AttributeError, TypeError) as error:
+                raise ValueError(f"{path}:{line_number}: invalid retrieval record: {error}") from error
+            if code.strip() and doc.strip():
+                yield {"code": code, "docstring": doc.strip().splitlines()[0]}
 
 
-# ================= 3. 辅助评估与训练逻辑 =================
-def evaluate_mrr(model, dataloader):
-    """计算 MRR 指标"""
+def sample_pairs(reader, path, fraction, seed):
+    # Choose the subset before materializing code strings from the full corpus.
+    total = sum(1 for _ in reader(path))
+    size = max(1, int(total * fraction))
+    if size < 2 or total < 2:
+        raise ValueError(f"{path}: need at least two sampled pairs (usable rows: {total})")
+    rng = np.random.default_rng(seed)
+    indices = set(rng.choice(total, size=size, replace=False))
+    return Dataset.from_list([row for index, row in enumerate(reader(path)) if index in indices])
+
+
+def evaluate_mrr(model, loader, device):
+    """Rank the single aligned code row for each query against the entire sampled pool."""
     model.eval()
-    code_vecs = []
-    query_vecs = []
-    
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="  Evaluating", leave=False):
-            code_inputs, query_inputs = batch
-            code_inputs = {k: v.to(DEVICE) for k, v in code_inputs.items()}
-            query_inputs = {k: v.to(DEVICE) for k, v in query_inputs.items()}
-            
-            c_vec = model.get_embeddings(code_inputs['input_ids'], code_inputs['attention_mask'])
-            q_vec = model.get_embeddings(query_inputs['input_ids'], query_inputs['attention_mask'])
-            
-            code_vecs.append(c_vec.cpu().numpy())
-            query_vecs.append(q_vec.cpu().numpy())
-            
-    code_vecs = np.concatenate(code_vecs, 0)
-    query_vecs = np.concatenate(query_vecs, 0)
-    
-    scores = np.matmul(query_vecs, code_vecs.T)
-    
-    ranks = []
-    for i in range(len(scores)):
-        score_row = scores[i]
-        sorted_indices = np.argsort(-score_row)
-        rank = np.where(sorted_indices == i)[0][0] + 1
-        ranks.append(1.0 / rank)
-        
-    return np.mean(ranks)
+    codes, queries = [], []
+    with torch.inference_mode():
+        for code, query in loader:
+            codes.append(model.get_embeddings(**code.to(device)).cpu().numpy())
+            queries.append(model.get_embeddings(**query.to(device)).cpu().numpy())
+    codes = np.concatenate(codes)
+    queries = np.concatenate(queries)
+    # A stable sort resolves exact score ties in candidate-file order.
+    reciprocal_ranks = []
+    for start in range(0, len(queries), 128):
+        scores = queries[start:start + 128] @ codes.T
+        for index, row in enumerate(scores, start=start):
+            order = np.argsort(-row, kind="stable")
+            rank = np.flatnonzero(order == index)[0] + 1
+            reciprocal_ranks.append(1.0 / rank)
+    return float(np.mean(reciprocal_ranks))
 
 
-def run_single_experiment(model_type, ratio, train_ds_raw, test_ds_raw):
-    """运行单个实验"""
-    print(f"\n{'-'*60}")
-    print(f"🚀 Experiment: Model={model_type}, Ratio={ratio}")
-    print(f"{'-'*60}")
-    
-    model_path = LOCAL_MODEL_PATHS[model_type]
-    # 如果本地没有，回退到在线加载
-    if not os.path.exists(model_path):
-        print(f"Warning: Local path {model_path} not found. Downloading from HuggingFace...")
-        model_path = "microsoft/codebert-base" if model_type == "codebert" else "Salesforce/codet5-base"
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+def run_single_experiment(args, ratio, train, test, model_path, tokenizer, device):
+    # Reset before each ratio so initialization, dropout and shuffling use the same seed.
+    set_seed(args.seed)
     simplifier = JavaCodeSimplifier()
-    
-    # --- 数据处理 ---
-    def preprocess_batch(batch):
-        codes = batch['code']
-        docstrings = batch['docstring']
-        simplified_codes = []
-        for c in codes:
-            try:
-                s_code = simplifier.simplify(c, remove_ratio=ratio)
-                simplified_codes.append(str(s_code))
-            except:
-                simplified_codes.append("")
-        
-        cleaned_docs = []
-        for d in docstrings:
-            d = str(d) if d is not None else ""
-            cleaned_docs.append(d.split('\n')[0]) 
-            
-        return simplified_codes, cleaned_docs
 
-    def collate_fn(batch):
-        code_list = [item['code_simplified'] for item in batch]
-        doc_list = [item['doc_cleaned'] for item in batch]
-        
-        code_inputs = tokenizer(code_list, padding=True, truncation=True, max_length=MAX_LENGTH, return_tensors="pt")
-        query_inputs = tokenizer(doc_list, padding=True, truncation=True, max_length=MAX_LENGTH, return_tensors="pt")
-        return code_inputs, query_inputs
+    def simplify(row):
+        return {"code": simplifier.simplify(row["code"], remove_ratio=ratio)}
 
-    def map_function(examples):
-        c, d = preprocess_batch(examples)
-        return {"code_simplified": c, "doc_cleaned": d}
+    def collate(rows):
+        options = dict(padding=True, truncation=True, max_length=256, return_tensors="pt",
+                       return_token_type_ids=False)
+        code = tokenizer([row["code"] for row in rows], **options)
+        query = tokenizer([row["docstring"] for row in rows], **options)
+        return code, query
 
-    # 处理数据集
-    train_ds = train_ds_raw.map(map_function, batched=True, batch_size=100, load_from_cache_file=False, desc="Processing Train")
-    test_ds = test_ds_raw.map(map_function, batched=True, batch_size=100, load_from_cache_file=False, desc="Processing Test")
-    
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, num_workers=NUM_WORKERS)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn, num_workers=NUM_WORKERS)
-    
-    # --- 模型训练 ---
-    model = CodeSearchModel(model_path, model_type=model_type)
+    train_loader = DataLoader(train.map(simplify, load_from_cache_file=False),
+                              batch_size=args.batch_size, shuffle=True, collate_fn=collate)
+    test_loader = DataLoader(test.map(simplify, load_from_cache_file=False),
+                             batch_size=args.batch_size, collate_fn=collate)
+    model = CodeSearchModel(model_path, model_type=args.model).to(device)
     if hasattr(model.encoder, "gradient_checkpointing_enable"):
         model.encoder.gradient_checkpointing_enable()
-        
-    model.to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-    
-    best_mrr = 0.0
-    
-    for epoch in range(EPOCHS):
-        model.train()
-        total_loss = 0
-        pbar = tqdm(train_loader, desc=f"  Epoch {epoch+1}/{EPOCHS}", leave=False)
-        for batch in pbar:
-            code_inputs, query_inputs = batch
-            code_inputs = {k: v.to(DEVICE) for k, v in code_inputs.items()}
-            query_inputs = {k: v.to(DEVICE) for k, v in query_inputs.items()}
-            
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
+    model.train()
+    for epoch in range(args.epochs):
+        for code, query in tqdm(train_loader, desc=f"Ratio {ratio:g} | epoch {epoch + 1}"):
             optimizer.zero_grad()
-            loss = model(code_inputs, query_inputs)
+            loss = model(code.to(device), query.to(device))
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-        
-        mrr = evaluate_mrr(model, test_loader)
-        print(f"  Epoch {epoch+1} finished. MRR: {mrr:.4f}")
-        if mrr > best_mrr: best_mrr = mrr
-            
-    # 清理
-    del model, optimizer, train_loader, test_loader
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    return best_mrr
+    return evaluate_mrr(model, test_loader, device)
 
-# ================= 4. 主程序 =================
+
+def main():
+    args = parse_args()
+    if args.output_dir.exists() and (not args.output_dir.is_dir() or any(args.output_dir.iterdir())):
+        raise SystemExit(f"Output is not an empty directory: {args.output_dir}. Choose a new --output-dir.")
+    train = sample_pairs(training_pairs, args.train_file, args.sample_fraction, args.seed)
+    test = sample_pairs(test_pairs, args.test_file, args.sample_fraction, args.seed)
+    local = Path(f"{args.model}-base-local")
+    model_path = args.model_path or (str(local) if local.is_dir() else MODELS[args.model])
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"{len(train)} training pairs, {len(test)} test candidates, device={device}")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    with (args.output_dir / "results.csv").open("x", newline="", encoding="utf-8") as dest:
+        fields = ["model", "model_path", "ratio", "test_mrr", "train_pairs", "test_pairs", "seed",
+                  "sample_fraction", "epochs", "batch_size", "train_file", "test_file"]
+        writer = csv.DictWriter(dest, fieldnames=fields)
+        writer.writeheader()
+        for ratio in args.ratios:
+            mrr = run_single_experiment(args, ratio, train, test, model_path, tokenizer, device)
+            print(f"ratio={ratio:g} | test MRR={mrr:.6f}")
+            row = dict(model=args.model, model_path=model_path, ratio=ratio, test_mrr=mrr,
+                       train_pairs=len(train), test_pairs=len(test), seed=args.seed,
+                       sample_fraction=args.sample_fraction, epochs=args.epochs,
+                       batch_size=args.batch_size, train_file=args.train_file, test_file=args.test_file)
+            results.append(row)
+            writer.writerow(row)
+            dest.flush()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(args.ratios, [row["test_mrr"] for row in results], marker="o", label=args.model)
+    ax.set(xlabel="Token removal ratio", ylabel="Test MRR", title="Java code search")
+    ax.legend()
+    ax.grid(alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(args.output_dir / "search_benchmark_result.png")
+    plt.close(fig)
+    print(f"Saved results.csv and search_benchmark_result.png to {args.output_dir}")
+
+
 if __name__ == "__main__":
-    # 1. 先加载原始数据 (只加载一次，不用每次循环都读文件)
-    raw_train_ds, raw_test_ds = load_custom_dataset()
-    
-
-    raw_train_ds = raw_train_ds.select(range(1000))
-    raw_test_ds = raw_test_ds.select(range(100))
-
-    results = {m: [] for m in MODELS_TO_TEST}
-    
-    try:
-        for model_type in MODELS_TO_TEST:
-            for ratio in RATIOS_TO_TEST:
-                score = run_single_experiment(model_type, ratio, raw_train_ds, raw_test_ds)
-                results[model_type].append(score)
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
-
-    # 绘图逻辑
-    print("\nResults:", results)
-    if any(len(v) > 0 for v in results.values()):
-        plt.figure(figsize=(10, 6))
-        for m, scores in results.items():
-            if scores:
-                plt.plot(RATIOS_TO_TEST[:len(scores)], scores, marker='o', label=m)
-        plt.title('Code Search MRR vs Simplification Ratio')
-        plt.xlabel('Simplification Ratio')
-        plt.ylabel('MRR')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig('search_benchmark_result.png')
-        print("Chart saved.")
+    main()

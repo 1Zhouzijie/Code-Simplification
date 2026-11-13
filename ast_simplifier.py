@@ -1,5 +1,8 @@
-import javalang
+import argparse
 import re
+from pathlib import Path
+
+import javalang
 
 
 class JavaCodeSimplifier:
@@ -132,3 +135,28 @@ class JavaCodeSimplifier:
         except Exception:
             # 任意异常都退回原始字符串
             return "" if code is None else str(code)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Simplify Java tokens for model input.")
+    parser.add_argument("file", type=Path, nargs="?", help="UTF-8 Java file (default: built-in example)")
+    parser.add_argument("--ratio", type=float, default=0.5, help="Fraction of tokens to remove (default: 0.5)")
+    args = parser.parse_args()
+    if not 0 <= args.ratio <= 1:
+        parser.error("--ratio must be a number between 0 and 1 inclusive")
+
+    source = "public static int square(int value) { return value * value; }"
+    if args.file is not None:
+        try:
+            source = args.file.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError) as error:
+            parser.error(f"could not read {args.file} as UTF-8: {error}")
+
+    print("Java source:")
+    print(source)
+    print(f"Model input (removal ratio {args.ratio:g}):")
+    print(JavaCodeSimplifier().simplify(source, remove_ratio=args.ratio))
+
+
+if __name__ == "__main__":
+    main()

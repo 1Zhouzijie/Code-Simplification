@@ -2,10 +2,19 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.venv/
+
+# Locally downloaded datasets and pretrained model snapshots
+/java/
+/java_research/
+/codet5-base-local/
+/codebert-base-local/
 
 # Training outputs
 codet5-simplified-*/
 final_model_*/
+/outputs/
+/search_benchmark_result.png
 
 # Model files
 *.bin

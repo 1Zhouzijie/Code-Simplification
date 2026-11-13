@@ -3,12 +3,14 @@ import torch.nn as nn
 from transformers import AutoModel, T5EncoderModel
 
 class CodeSearchModel(nn.Module):
-    def __init__(self, model_name_or_path, model_type="codebert"):
+    def __init__(self, model_name_or_path, model_type=None):
         super().__init__()
+        if model_type is None:
+            model_type = "codet5" if "t5" in str(model_name_or_path).lower() else "codebert"
         self.model_type = model_type
         
         # 根据类型加载不同的骨干网络
-        if "t5" in model_name_or_path or model_type == "codet5":
+        if model_type == "codet5":
             # CodeT5 我们只用 Encoder
             self.encoder = T5EncoderModel.from_pretrained(model_name_or_path)
             self.hidden_size = self.encoder.config.d_model
